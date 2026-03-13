@@ -1,0 +1,16 @@
+# Default initial positions for robot_new's ros2_control fake system
+
+initial_positions:
+  joint_1: 0.0
+  joint_2: 0.0
+  joint_3: 0.0
+  joint_4: 0.0
+  joint_5: 0.0
+  joint_6: 0.0
+  joint_7: 0.0
+  left_grep_joint: 0.0
+  straight_joint: 0.0
+  front_wheel_joint: 0.0
+  rear_wheel_joint: 0.0
+  front_clamp_wheel_joint: 0.0
+  rear_clamp_wheel_joint: 0.0

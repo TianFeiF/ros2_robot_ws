@@ -1,0 +1,22 @@
+sensors:
+  - default_sensor
+  - livox_extruded
+default_sensor:
+  filtered_cloud_topic: /livox/filtered_fake_cloud
+  max_range: 2.5
+  max_update_rate: 5.0
+  padding_offset: 0.0
+  padding_scale: 1.0
+  point_cloud_topic: /livox/extruded_cloud_to_moveit
+  point_subsample: 1
+  sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+livox_extruded:
+  filtered_cloud_topic: /livox/filtered_fake_cloud
+  max_range: 2.5
+  max_update_rate: 5.0
+  padding_offset: 0.0
+  padding_scale: 1.0
+  point_cloud_topic: /livox/extruded_cloud_to_moveit
+  point_subsample: 1
+  queue_size: 1
+  sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater

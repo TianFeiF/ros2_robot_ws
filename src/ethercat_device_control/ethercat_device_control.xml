@@ -1,0 +1,9 @@
+<library path="ethercat_device_control">
+  <class name="ethercat_device_control/EthercatHardwareInterface"
+         type="ethercat_device_control::EthercatHardwareInterface"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Generic EtherCAT Hardware Interface for 5-DOF Robot
+    </description>
+  </class>
+</library>
