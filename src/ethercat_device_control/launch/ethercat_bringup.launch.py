@@ -25,9 +25,9 @@ def generate_launch_description():
     # Use the controller config from this package
     robot_controllers = PathJoinSubstitution(
         [
-            FindPackageShare("ethercat_device_control"),
+            FindPackageShare("robot_new_moveit"),
             "config",
-            "controllers.yaml",
+            "ros2_controllers.yaml",
         ]
     )
 

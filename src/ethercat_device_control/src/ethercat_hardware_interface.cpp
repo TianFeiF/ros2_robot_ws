@@ -30,6 +30,12 @@ const uint16_t EYOU_SERVO_POS[NUM_SLAVES] = {0, 1, 2, 3, 4};
 const uint32_t VENDOR_ID = 0x00001097;    // 厂商ID (根据 ethercat cstruct 输出)
 const uint32_t PRODUCT_CODE = 0x00002406; // 产品代码 (根据 ethercat cstruct 输出)
 
+// 转换常量 (straight_joint)
+// 1 圈 = 65535 * 101 pulses
+// 1 圈 = 20 mm = 0.02 m
+// Pulses/Meter = (65535 * 101) / 0.02 = 330951750
+const double STRAIGHT_JOINT_PULSES_PER_METER = (65535.0 * 101.0) / 0.02;
+
 // CiA 402 Controlword (控制字) 命令定义
 #define CTRL_SHUTDOWN       0x0006 // 关闭
 #define CTRL_SWITCH_ON      0x0007 // 开启
@@ -383,6 +389,11 @@ hardware_interface::return_type EthercatHardwareInterface::read(
       for (int i = 0; i < NUM_SLAVES; ++i) {
           // 默认操作模式为 CSP (8)
           int8_t target_mode = 8;
+          if (i == 1 || i == 2) {
+              target_mode = 9; // CSV
+          } else if (i == 3 || i == 4) {
+              target_mode = 10; // CST
+          }
           uint16_t status = EC_READ_U16(domain_pd_ + pdo_offset_.status_word[i]);
           uint16_t control = 0x00;
           int16_t actual_torque = EC_READ_S16(domain_pd_ + pdo_offset_.actual_torque[i]);
@@ -452,7 +463,7 @@ hardware_interface::return_type EthercatHardwareInterface::read(
                       EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[i], -280);
                       
                       // 直到实际力矩小于-302后记录第一次实际位置
-                      if (actual_torque < -282) {
+                      if (actual_torque < -300) {
                           int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
                           calib_positions_.push_back(current_pos);
                           RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "记录位置: %d", current_pos);
@@ -593,11 +604,21 @@ hardware_interface::return_type EthercatHardwareInterface::read(
               int slave_idx = JOINT_TO_SLAVE_MAP.at(joint_name);
               
               int32_t pos_val = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[slave_idx]);
-              hw_states_position_[i] = static_cast<double>(pos_val);
+              if (slave_idx == 0) {
+                  // Slave 0 (straight_joint): Pulses -> Meters
+                  hw_states_position_[i] = static_cast<double>(pos_val) / STRAIGHT_JOINT_PULSES_PER_METER;
+              } else {
+                  hw_states_position_[i] = static_cast<double>(pos_val);
+              }
               
               // 读取速度和力矩
               int32_t vel_val = EC_READ_S32(domain_pd_ + pdo_offset_.actual_velocity[slave_idx]);
-              hw_states_velocity_[i] = static_cast<double>(vel_val);
+              if (slave_idx == 0) {
+                   // Slave 0: Pulses/s -> Meters/s (Optional, assuming velocity scales similarly)
+                   hw_states_velocity_[i] = static_cast<double>(vel_val) / STRAIGHT_JOINT_PULSES_PER_METER;
+              } else {
+                   hw_states_velocity_[i] = static_cast<double>(vel_val);
+              }
               
               int16_t tor_val = EC_READ_S16(domain_pd_ + pdo_offset_.actual_torque[slave_idx]);
               hw_states_effort_[i] = static_cast<double>(tor_val);
@@ -664,12 +685,21 @@ hardware_interface::return_type EthercatHardwareInterface::write(
                        // 刚刚完成校准，我们可能还没收到来自 Controller 的 0 指令
                        // 此时 hw_commands_position_ 可能还是旧值 (校准前的状态)
                        // 强制覆盖为 0
-                       if (std::abs(hw_commands_position_[i]) > 100000) { // 简单保护：如果指令位置太大，说明 Controller 还没接管
+                       if (std::abs(hw_commands_position_[i]) > 0.5) { // 简单保护：如果指令位置太大(>0.5m)，说明 Controller 还没接管
                            hw_commands_position_[i] = 0;
                        }
                    }
                    
-                   EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[slave_idx], static_cast<int32_t>(hw_commands_position_[i]));
+                   if (slave_idx == 0) {
+                       // Slave 0: Meters -> Pulses
+                       int32_t target_pulses = static_cast<int32_t>(hw_commands_position_[i] * STRAIGHT_JOINT_PULSES_PER_METER);
+                       EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[slave_idx], target_pulses);
+                   } else if (slave_idx == 1 || slave_idx == 2) {
+                       EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[slave_idx], static_cast<int32_t>(hw_commands_velocity_[i]));
+                   } else if (slave_idx == 3 || slave_idx == 4) {
+                       EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[slave_idx], static_cast<int16_t>(hw_commands_effort_[i]));
+                   }
+
                    if(slave_idx == 0)
                    {
                       // 写入 home offset 到 PDO
