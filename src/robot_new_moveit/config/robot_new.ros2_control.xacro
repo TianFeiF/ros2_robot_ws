@@ -1,13 +1,16 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
     <xacro:macro name="robot_new_ros2_control" params="name initial_positions_file">
-        <xacro:property name="initial_positions" value="${load_yaml(initial_positions_file)['initial_positions']}"/>
+        <xacro:property name="initial_positions" value="${xacro.load_yaml(initial_positions_file)['initial_positions']}"/>
 
-        <ros2_control name="${name}" type="system">
+        <!-- EtherCAT System: Controls the 5 custom motors -->
+        <ros2_control name="EthercatSystem" type="system">
             <hardware>
                 <plugin>ethercat_device_control/EthercatHardwareInterface</plugin>
                 <param name="use_dummy_mode">false</param>
             </hardware>
+            
+            <!-- Slave 0: Straight Joint (Participates in motion planning) -->
             <joint name="straight_joint">
                 <command_interface name="position"/>
                 <command_interface name="velocity"/>
@@ -16,6 +19,63 @@
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
+            
+            <!-- Slave 1: Front Wheel -->
+            <joint name="front_wheel_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <command_interface name="effort"/>
+                <state_interface name="position">
+                  <param name="initial_value">0.0</param>
+                </state_interface>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+            </joint>
+            
+            <!-- Slave 2: Rear Wheel -->
+            <joint name="rear_wheel_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <command_interface name="effort"/>
+                <state_interface name="position">
+                  <param name="initial_value">0.0</param>
+                </state_interface>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+            </joint>
+
+            <!-- Slave 3: Rear Clamp Wheel -->
+            <joint name="rear_clamp_wheel_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <command_interface name="effort"/>
+                <state_interface name="position">
+                  <param name="initial_value">0.0</param>
+                </state_interface>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+            </joint>
+
+            <!-- Slave 4: Front Clamp Wheel -->
+            <joint name="front_clamp_wheel_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <command_interface name="effort"/>
+                <state_interface name="position">
+                  <param name="initial_value">0.0</param>
+                </state_interface>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+            </joint>
+        </ros2_control>
+
+        <!-- RealMan System: Controls the robotic arm -->
+        <ros2_control name="RealManSystem" type="system">
+            <hardware>
+                <!-- Use the newly created RealMan hardware interface -->
+                <plugin>rm_hardware_interface/RmHardwareInterface</plugin>
+            </hardware>
+            
             <joint name="joint_1">
                 <command_interface name="position"/>
                 <command_interface name="velocity"/>
@@ -80,46 +140,7 @@
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="front_wheel_joint">
-                <command_interface name="position"/>
-                <command_interface name="velocity"/>
-                <command_interface name="effort"/>
-                <state_interface name="position">
-                  <param name="initial_value">0.0</param>
-                </state_interface>
-                <state_interface name="velocity"/>
-                <state_interface name="effort"/>
-            </joint>
-            <joint name="rear_wheel_joint">
-                <command_interface name="position"/>
-                <command_interface name="velocity"/>
-                <command_interface name="effort"/>
-                <state_interface name="position">
-                  <param name="initial_value">0.0</param>
-                </state_interface>
-                <state_interface name="velocity"/>
-                <state_interface name="effort"/>
-            </joint>
-            <joint name="front_clamp_wheel_joint">
-                <command_interface name="position"/>
-                <command_interface name="velocity"/>
-                <command_interface name="effort"/>
-                <state_interface name="position">
-                  <param name="initial_value">0.0</param>
-                </state_interface>
-                <state_interface name="velocity"/>
-                <state_interface name="effort"/>
-            </joint>
-            <joint name="rear_clamp_wheel_joint">
-                <command_interface name="position"/>
-                <command_interface name="velocity"/>
-                <command_interface name="effort"/>
-                <state_interface name="position">
-                  <param name="initial_value">0.0</param>
-                </state_interface>
-                <state_interface name="velocity"/>
-                <state_interface name="effort"/>
-            </joint>
         </ros2_control>
+
     </xacro:macro>
 </robot>

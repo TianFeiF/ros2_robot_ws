@@ -36,6 +36,16 @@ const uint32_t PRODUCT_CODE = 0x00002406; // 产品代码 (根据 ethercat cstru
 // Pulses/Meter = (65535 * 101) / 0.02 = 330951750
 const double STRAIGHT_JOINT_PULSES_PER_METER = (65535.0 * 101.0) / 0.02;
 
+// 转换常量 (wheel_joint)
+const double WHEEL_JOINT_PULSES_PER_REV = 65535.0 * 101.0;
+const double WHEEL_JOINT_RAD_PER_REV = 2.0 * M_PI;
+const double WHEEL_JOINT_PULSES_PER_RAD = WHEEL_JOINT_PULSES_PER_REV / WHEEL_JOINT_RAD_PER_REV;
+
+// 转换常量 (clamp_wheel_joint)
+const double CLAMP_WHEEL_TORQUE_RAW_MAX = 1000.0;
+const double CLAMP_WHEEL_TORQUE_NM_MAX = 6.8;
+const double CLAMP_WHEEL_NM_PER_RAW = CLAMP_WHEEL_TORQUE_NM_MAX / CLAMP_WHEEL_TORQUE_RAW_MAX;
+
 // CiA 402 Controlword (控制字) 命令定义
 #define CTRL_SHUTDOWN       0x0006 // 关闭
 #define CTRL_SWITCH_ON      0x0007 // 开启
@@ -95,16 +105,118 @@ const std::map<std::string, int> JOINT_TO_SLAVE_MAP = {
     {"front_clamp_wheel_joint", 4}
 };
 
-// 辅助函数：写 SDO
-void EthercatHardwareInterface::write_sdo_int32(int32_t value) {
-    if (sdo_home_offset_) {
-        // ecrt_sdo_request_data_size 是获取大小，不是设置大小
-        // SDO 请求的大小在创建时已经指定为 4 字节
-        
-        // 使用 EC_WRITE_S32 处理字节序 (Host to Little Endian)
-        EC_WRITE_S32(ecrt_sdo_request_data(sdo_home_offset_), value);
-        // 触发写入请求
-        ecrt_sdo_request_write(sdo_home_offset_);
+// Zero Calibration Logic (Slave 0 Only)
+void EthercatHardwareInterface::handle_zero_calibration(int slave_idx, const rclcpp::Duration & period, int8_t & target_mode, int16_t actual_torque) {
+    if (slave_idx != 0) return; // Only for straight_joint (Slave 0)
+    if (calib_state_ == CalibState::DONE || calib_state_ == CalibState::IDLE) return;
+
+    switch (calib_state_) {
+        case CalibState::INIT:
+            RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Start Zero Calibration: Initialize Software Offset");
+            hw_home_offset_[slave_idx] = 0;
+            calib_state_ = CalibState::LOOP_START;
+            calib_loop_count_ = 0;
+            break;
+
+        case CalibState::LOOP_START:
+            if (calib_loop_count_ < 3) {
+                RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Calibration Loop %d: Move Away (Ramping Up)", calib_loop_count_ + 1);
+                calib_timer_ = 0.0;
+                current_calib_velocity_ = 0.0;
+                calib_state_ = CalibState::MOVE_AWAY;
+            } else {
+                calib_state_ = CalibState::CALC_OFFSET;
+            }
+            break;
+
+        case CalibState::MOVE_AWAY:
+            // 1. Enter CSV Mode
+            target_mode = 9; // CSV
+            
+            // 2. Ramping Up Velocity (Target: 50000 pulses/s)
+            if (current_calib_velocity_ < 1103172*2) {
+                current_calib_velocity_ += 600000.0 * period.seconds();
+                if (current_calib_velocity_ > 1103172*2) current_calib_velocity_ = 1103172*2;
+            }
+            
+            EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[slave_idx], (int32_t)current_calib_velocity_);
+
+            // 3. Run for 2.0 seconds
+            calib_timer_ += period.seconds();
+            if (calib_timer_ >= 2.0) {
+                RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Calibration Loop %d: Move Close (Ramping Down)", calib_loop_count_ + 1);
+                calib_state_ = CalibState::MOVE_CLOSE;
+                calib_timer_ = 0.0; // Reset timer for next state
+            }
+            break;
+
+        case CalibState::MOVE_CLOSE:
+            // 1. Enter CSV Mode
+            target_mode = 9; // CSV
+            
+            // 2. Ramping Down to Negative Velocity (Target: -50000 pulses/s)
+            if (current_calib_velocity_ > -1103172) {
+                current_calib_velocity_ -= 600000.0 * period.seconds();
+                if (current_calib_velocity_ < -1103172) current_calib_velocity_ = -1103172;
+            }
+            
+            EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[slave_idx], (int32_t)current_calib_velocity_);
+            
+            calib_timer_ += period.seconds();
+            
+            // 3. Detect Hard Stop (Torque Limit)
+            // Use absolute value for robustness
+            if (std::abs(actual_torque) > 250) {
+            //if (actual_torque < -250) {
+                int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[slave_idx]);
+                calib_positions_.push_back(current_pos);
+                RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Hard Stop Detected (Torque: %d), Position: %d", actual_torque, current_pos);
+                
+                calib_loop_count_++;
+                current_calib_velocity_ = 0.0; // Reset velocity
+                calib_state_ = CalibState::LOOP_START;
+            } else if (calib_timer_ > 60.0) { // Timeout Protection (10s)
+                RCLCPP_WARN(rclcpp::get_logger("EthercatHardwareInterface"), "Calibration Timeout (%.1f s), Retrying Loop...", calib_timer_);
+                current_calib_velocity_ = 0.0;
+                calib_state_ = CalibState::LOOP_START;
+            }
+            break;
+
+        case CalibState::CALC_OFFSET:
+            {
+                // Calculate Average Position as Software Offset
+                double sum = std::accumulate(calib_positions_.begin(), calib_positions_.end(), 0.0);
+                double avg = sum / calib_positions_.size();
+                int32_t offset = static_cast<int32_t>(avg);
+                
+                RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Avg Position: %.2f, Software Offset: %d", avg, offset);
+                // Save offset to member variable (applied in read/write)
+                hw_home_offset_[slave_idx] = offset;
+                
+                calib_state_ = CalibState::MOVE_TO_ZERO;
+                calib_timer_ = 0.0;
+            }
+            break;
+
+        case CalibState::MOVE_TO_ZERO:
+            {
+                // Read current hardware position
+                int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[slave_idx]);
+                
+                // Set target to current position to prevent jump
+                EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[slave_idx], current_pos);
+                
+                // Update ROS 2 Control State (Software Position = Hardware - Offset)
+                int32_t software_pos = current_pos - hw_home_offset_[slave_idx];
+                hw_commands_position_[slave_idx] = static_cast<double>(software_pos) / STRAIGHT_JOINT_PULSES_PER_METER;
+                
+                RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Calibration Done. Hardware Pos: %d, Software Pos: %d", current_pos, software_pos);
+                calib_state_ = CalibState::DONE;
+            }
+            break;
+            
+        default:
+            break;
     }
 }
 
@@ -204,19 +316,6 @@ hardware_interface::CallbackReturn EthercatHardwareInterface::on_configure(
             RCLCPP_FATAL(rclcpp::get_logger("EthercatHardwareInterface"), "配置从站 %d 的 PDO 失败", i);
             return hardware_interface::CallbackReturn::ERROR;
         }
-    }
-
-    // --- 创建 SDO 请求 (0x607C:00) ---
-    // Slave 0 (straight_joint) 
-    if (slave_config_[0]) {
-        // 创建 SDO 请求: 索引 0x607C, 子索引 0x00, 大小 4 bytes
-        sdo_home_offset_ = ecrt_slave_config_create_sdo_request(slave_config_[0], 0x607C, 0x00, 4);
-        if (!sdo_home_offset_) {
-            RCLCPP_ERROR(rclcpp::get_logger("EthercatHardwareInterface"), "创建 SDO 请求 (0x607C) 失败！");
-            return hardware_interface::CallbackReturn::ERROR;
-        }
-        // 设置超时
-        ecrt_sdo_request_timeout(sdo_home_offset_, 2000); // 2000ms
     }
 
   // 预分配所有 PDO offset 向量
@@ -367,6 +466,108 @@ hardware_interface::CallbackReturn EthercatHardwareInterface::on_activate(
   calib_loop_count_ = 0;
   calib_timer_ = 0.0;
   calib_positions_.clear();
+  
+  if (!use_dummy_mode_) {
+      RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "开始阻塞式零点校准...");
+      auto last_time = std::chrono::steady_clock::now();
+      
+      while (rclcpp::ok() && calib_state_ != CalibState::DONE) {
+           auto now = std::chrono::steady_clock::now();
+           auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_time);
+           rclcpp::Duration period(period_ns);
+           last_time = now;
+           
+          ecrt_master_receive(master_);
+          ecrt_domain_process(domain_);
+          
+          for (int i = 0; i < NUM_SLAVES; ++i) {
+              // 默认 CSP
+              int8_t target_mode = 8;
+              if (i == 1 || i == 2) target_mode = 9; // CSV
+              else if (i == 3 || i == 4) target_mode = 10; // CST
+              
+              int16_t actual_torque = EC_READ_S16(domain_pd_ + pdo_offset_.actual_torque[i]);
+              
+              // 调用校准逻辑 (仅 Slave 0)
+              handle_zero_calibration(i, period, target_mode, actual_torque);
+              
+              // 写入 Mode of Operation
+              EC_WRITE_S8(domain_pd_ + pdo_offset_.mode_of_operation[i], target_mode);
+              
+              // 状态机逻辑 (Enable Operation)
+              uint16_t status = EC_READ_U16(domain_pd_ + pdo_offset_.status_word[i]);
+              uint16_t control = 0x00;
+              
+              if (status & (1 << 3)) { // Fault
+                  control = 0x80; // Fault Reset
+              } else {
+                  switch (status & 0x6F) {
+                      case 0x00:
+                      case 0x40:
+                          control = 0x06; // Shutdown
+                          break;
+                      case 0x21: // Ready to Switch On
+                          control = 0x07; // Switch On
+                          {
+                              // 防止飞车: 确保在使能前，目标位置等于当前位置
+                              int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
+                              EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], current_pos);
+                          }
+                          break;
+                      case 0x23: // Switched On
+                          control = 0x0F; // Enable Operation
+                          break;
+                      case 0x27: // Operation Enabled
+                          control = 0x0F; // Enable Operation
+                          break;
+                      default:
+                          control = 0x06; // Shutdown (Default)
+                          break;
+                  }
+              }
+              EC_WRITE_U16(domain_pd_ + pdo_offset_.control_word[i], control);
+              
+              // Note: Offset writing is handled in software now, no need to write to hardware 0x607C
+          }
+          
+          ecrt_domain_queue(domain_);
+          ecrt_master_send(master_);
+          
+          // 维持 1ms 周期
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+
+      if (!rclcpp::ok()) {
+          RCLCPP_WARN(rclcpp::get_logger("EthercatHardwareInterface"), "阻塞式零点校准被中断！正在停止电机...");
+          // 循环几次确保命令下达并让状态机响应
+          for (int cycle = 0; cycle < 50; ++cycle) {
+              ecrt_master_receive(master_);
+              ecrt_domain_process(domain_);
+
+              for (int i = 0; i < NUM_SLAVES; ++i) {
+                  // 1. 将目标速度和力矩设为 0
+                  EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[i], 0);
+                  EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[i], 0);
+
+                  // 2. 将目标位置设为当前位置，防止跳变
+                  int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
+                  EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], current_pos);
+
+                  // 3. 将控制字设为 Shutdown (0x06)，使电机退出 Operation Enabled 状态
+                  EC_WRITE_U16(domain_pd_ + pdo_offset_.control_word[i], CTRL_SHUTDOWN);
+              }
+
+              ecrt_domain_queue(domain_);
+              ecrt_master_send(master_);
+
+              std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          }
+          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "中断处理完成，电机已安全关闭!");
+          return hardware_interface::CallbackReturn::ERROR;
+      }
+
+      RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "阻塞式零点校准完成!");
+  }
 
   RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "EtherCAT 系统开始运行。");
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -375,179 +576,64 @@ hardware_interface::CallbackReturn EthercatHardwareInterface::on_activate(
 hardware_interface::CallbackReturn EthercatHardwareInterface::on_deactivate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "EtherCAT 已停止!");
+  RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "正在停止 EtherCAT 电机并关闭...");
+
+  if (!use_dummy_mode_ && master_ && domain_pd_) {
+      // 循环几次确保命令下达并让状态机响应
+      for (int cycle = 0; cycle < 50; ++cycle) {
+          ecrt_master_receive(master_);
+          ecrt_domain_process(domain_);
+
+          for (int i = 0; i < NUM_SLAVES; ++i) {
+              // 1. 将目标速度和力矩设为 0
+              EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[i], 0);
+              EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[i], 0);
+
+              // 2. 将目标位置设为当前位置，防止跳变
+              int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
+              EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], current_pos);
+
+              // 3. 将控制字设为 Shutdown (0x06)，使电机退出 Operation Enabled 状态
+              EC_WRITE_U16(domain_pd_ + pdo_offset_.control_word[i], CTRL_SHUTDOWN);
+          }
+
+          ecrt_domain_queue(domain_);
+          ecrt_master_send(master_);
+
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "EtherCAT 已停止，电机已安全关闭!");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::return_type EthercatHardwareInterface::read(
-  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
   if (!use_dummy_mode_) {
       ecrt_master_receive(master_);
       ecrt_domain_process(domain_);
 
       for (int i = 0; i < NUM_SLAVES; ++i) {
-          // 默认操作模式为 CSP (8)
+          // Default to CSP Mode (8)
           int8_t target_mode = 8;
           if (i == 1 || i == 2) {
-              target_mode = 9; // CSV
+              target_mode = 9; // CSV for Wheels
           } else if (i == 3 || i == 4) {
-              target_mode = 10; // CST
+              target_mode = 10; // CST for Clamp Wheels
           }
+          
           uint16_t status = EC_READ_U16(domain_pd_ + pdo_offset_.status_word[i]);
           uint16_t control = 0x00;
-          int16_t actual_torque = EC_READ_S16(domain_pd_ + pdo_offset_.actual_torque[i]);
           
-          // --- 零点校准逻辑 (仅针对 straight_joint = Slave 0) ---
-          if (i == 0 && calib_state_ != CalibState::DONE && calib_state_ != CalibState::IDLE) {
-              
-              switch (calib_state_) {
-                  case CalibState::INIT:
-                      RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "开始零点校准: 写入 0 到 0x607C (通过PDO)");
-                      // 通过 PDO 写入 0
-                      hw_home_offset_[i] = 0;
-                      
-                      // 为了确保写入生效，我们还是保留 SDO 读取检查
-                      calib_state_ = CalibState::READ_ZERO;
-                      break;
+          // Note: Actual torque is read but unused in main loop logic (used in calibration)
+          // int16_t actual_torque = EC_READ_S16(domain_pd_ + pdo_offset_.actual_torque[i]);
 
-                  // 移除 WAIT_WRITE_ZERO 状态
-                  
-                  case CalibState::READ_ZERO:
-                      // 等待几个周期让 PDO 生效
-                      calib_timer_ += period.seconds();
-                      if (calib_timer_ > 0.1) {
-                           ecrt_sdo_request_read(sdo_home_offset_);
-                           calib_state_ = CalibState::WAIT_READ_ZERO;
-                           calib_timer_ = 0.0;
-                      }
-                      break;
-
-                  case CalibState::WAIT_READ_ZERO:
-                      if (ecrt_sdo_request_state(sdo_home_offset_) == EC_REQUEST_SUCCESS) {
-                          // 确保使用 EC_READ_S32 处理字节序
-                          int32_t val = EC_READ_S32(ecrt_sdo_request_data(sdo_home_offset_));
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "读取 0x607C 当前值: %d (应为0)", val);
-                          calib_state_ = CalibState::LOOP_START;
-                          calib_loop_count_ = 0;
-                      } else if (ecrt_sdo_request_state(sdo_home_offset_) == EC_REQUEST_ERROR) {
-                          RCLCPP_ERROR(rclcpp::get_logger("EthercatHardwareInterface"), "SDO 读取失败，重试...");
-                          calib_state_ = CalibState::READ_ZERO;
-                      }
-                      break;
-
-                  case CalibState::LOOP_START:
-                      if (calib_loop_count_ < 3) {
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "校准循环 %d: 远离零点 (200力矩)", calib_loop_count_ + 1);
-                          calib_timer_ = 0.0;
-                          calib_state_ = CalibState::MOVE_AWAY;
-                      } else {
-                          calib_state_ = CalibState::CALC_OFFSET;
-                      }
-                      break;
-
-                  case CalibState::MOVE_AWAY:
-                      // 2. 进入同步力矩模式，电机以200的目标力矩运行2s
-                      target_mode = 10; // CST
-                      EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[i], 200);
-                      calib_timer_ += period.seconds();
-                      if (calib_timer_ >= 2.0) {
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "校准循环 %d: 接近零点 (-300力矩)", calib_loop_count_ + 1);
-                          calib_state_ = CalibState::MOVE_CLOSE;
-                      }
-                      break;
-
-                  case CalibState::MOVE_CLOSE:
-                      // 然后再以-300的目标力矩运行
-                      target_mode = 10; // CST
-                      EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[i], -280);
-                      
-                      // 直到实际力矩小于-302后记录第一次实际位置
-                      if (actual_torque < -300) {
-                          int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
-                          calib_positions_.push_back(current_pos);
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "记录位置: %d", current_pos);
-                          
-                          calib_loop_count_++;
-                          calib_state_ = CalibState::LOOP_START;
-                      }
-                      break;
-
-                  case CalibState::CALC_OFFSET:
-                      {
-                          // 3. 将三次的平均值取反并写入0x607C:00
-                          double sum = std::accumulate(calib_positions_.begin(), calib_positions_.end(), 0.0);
-                          double avg = sum / calib_positions_.size();
-                          int32_t offset = static_cast<int32_t>(-avg);
-                          
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "平均位置: %.2f, 写入偏移量: %d", avg, offset);
-                          // 通过 PDO 写入偏移量
-                          hw_home_offset_[i] = offset;
-                          calib_state_ = CalibState::READ_OFFSET;
-                          calib_timer_ = 0.0;
-                      }
-                      break;
-
-                  case CalibState::READ_OFFSET:
-                      calib_timer_ += period.seconds();
-                      if (calib_timer_ > 0.1) {
-                          ecrt_sdo_request_read(sdo_home_offset_);
-                          calib_state_ = CalibState::WAIT_READ_OFFSET;
-                          calib_timer_ = 0.0;
-                      }
-                      break;
-
-                  case CalibState::WAIT_READ_OFFSET:
-                      if (ecrt_sdo_request_state(sdo_home_offset_) == EC_REQUEST_SUCCESS) {
-                          int32_t val = EC_READ_S32(ecrt_sdo_request_data(sdo_home_offset_));
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "读取 0x607C 新值: %d", val);
-                          calib_timer_ = 0.0;
-                          calib_state_ = CalibState::STABILIZE;
-                      } else if (ecrt_sdo_request_state(sdo_home_offset_) == EC_REQUEST_ERROR) {
-                          RCLCPP_ERROR(rclcpp::get_logger("EthercatHardwareInterface"), "SDO 读取失败，重试...");
-                          calib_state_ = CalibState::READ_OFFSET;
-                      }
-                      break;
-                  
-                  case CalibState::STABILIZE:
-                      // 直接失能电机，等待1s
-                      // Controlword 将在下方被强制覆盖为 0x06
-                      calib_timer_ += period.seconds();
-                      if (calib_timer_ >= 1.0) {
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "系统稳定，准备运动到零点");
-                          calib_state_ = CalibState::MOVE_TO_ZERO;
-                      }
-                      break;
-
-                  case CalibState::MOVE_TO_ZERO:
-                      {
-                          // 再次读取当前真实位置
-                           int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
-                           (void)current_pos; // 消除未使用变量警告
-                          
-                          // 由于我们希望运动到零点，且此时 Offset 已生效
-                          // 我们应该将目标位置设为 0
-                          // 但是为了安全，我们还是先同步当前位置，然后依靠上层控制器(MoveIt/Controller)发 0 指令
-                          // 或者，如果这是一个单纯的 Homing 过程，我们可以在这里强制设为 0
-                          
-                          // 根据用户要求：最后应该运动到 0 点
-                          EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], 0);
-                          hw_commands_position_[i] = 0.0;
-                          
-                          RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "零点校准完全完成，强制目标位置为 0，切换回 CSP 模式");
-                          calib_state_ = CalibState::DONE;
-                      }
-                      break;
-                      
-                  default:
-                      break;
-              }
-          }
-
-          // 1. 设置操作模式 (CST during calibration, CSP otherwise)
+          // 1. Set Operation Mode
           EC_WRITE_S8(domain_pd_ + pdo_offset_.mode_of_operation[i], target_mode);
-
-          // 2. 状态机逻辑
+          
+          // 2. Standard CiA 402 State Machine
           if (status & (1 << 3)) { // Fault
               control = 0x80; // Fault Reset
           } else {
@@ -559,15 +645,9 @@ hardware_interface::return_type EthercatHardwareInterface::read(
                   case 0x21: // Ready to Switch On
                       control = 0x07; // Switch On
                       {
-                          // 防止飞车: 确保在使能前，目标位置等于当前位置
+                          // Prevent Jump: Sync Target to Actual before enabling
                           int32_t current_pos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[i]);
-                          
-                          // 特殊处理：如果刚刚完成校准 (DONE)，目标位置应该为 0
-                          if (i == 0 && calib_state_ == CalibState::DONE) {
-                              EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], 0);
-                          } else {
-                              EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], current_pos);
-                          }
+                          EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[i], current_pos);
                       }
                       break;
                   case 0x23: // Switched On
@@ -580,22 +660,11 @@ hardware_interface::return_type EthercatHardwareInterface::read(
                       control = 0x06; // Shutdown (Default)
                       break;
               }
-
-              // 强制失能 (STABILIZE 阶段)
-              if (i == 0 && calib_state_ == CalibState::STABILIZE) {
-                  control = 0x06;
-              }
-              
-              // 强制状态转换 (MOVE_TO_ZERO 阶段): 确保从 0x06 -> 0x07 -> 0x0F
-              // 因为在 STABILIZE 阶段我们强制了 0x06 (Shutdown)
-              // 当进入 MOVE_TO_ZERO -> DONE 后，状态机需要重新使能
-              // 这里我们不做特殊处理，依赖上面的标准状态机逻辑即可
-              // 但是为了防止 DONE 瞬间的跳变，我们在 MOVE_TO_ZERO 中已经设置了 Target=0
           }
           EC_WRITE_U16(domain_pd_ + pdo_offset_.control_word[i], control);
       }
       
-      // 更新 ROS 2 Control 的状态变量
+      // Update ROS 2 Control State Variables
       for (uint i = 0; i < info_.joints.size(); i++)
       {
           std::string joint_name = info_.joints[i].name;
@@ -603,47 +672,45 @@ hardware_interface::return_type EthercatHardwareInterface::read(
           if (JOINT_TO_SLAVE_MAP.count(joint_name) > 0) {
               int slave_idx = JOINT_TO_SLAVE_MAP.at(joint_name);
               
+              // Read Position
               int32_t pos_val = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[slave_idx]);
               if (slave_idx == 0) {
-                  // Slave 0 (straight_joint): Pulses -> Meters
-                  hw_states_position_[i] = static_cast<double>(pos_val) / STRAIGHT_JOINT_PULSES_PER_METER;
+                  // Slave 0 (straight_joint): Apply Software Offset
+                  int32_t software_pos = pos_val - hw_home_offset_[slave_idx];
+                  hw_states_position_[i] = static_cast<double>(software_pos) / STRAIGHT_JOINT_PULSES_PER_METER;
+              } else if (slave_idx == 1 || slave_idx == 2) {
+                  // Slave 1, 2 (wheel_joints): Convert pulses to radians
+                  hw_states_position_[i] = static_cast<double>(pos_val) / WHEEL_JOINT_PULSES_PER_RAD;
               } else {
-                  hw_states_position_[i] = static_cast<double>(pos_val);
+                  hw_states_position_[i] = static_cast<double>(pos_val) / WHEEL_JOINT_PULSES_PER_RAD;
               }
               
-              // 读取速度和力矩
+              // Read Velocity
               int32_t vel_val = EC_READ_S32(domain_pd_ + pdo_offset_.actual_velocity[slave_idx]);
               if (slave_idx == 0) {
-                   // Slave 0: Pulses/s -> Meters/s (Optional, assuming velocity scales similarly)
                    hw_states_velocity_[i] = static_cast<double>(vel_val) / STRAIGHT_JOINT_PULSES_PER_METER;
+              } else if (slave_idx == 1 || slave_idx == 2) {
+                   // Slave 1, 2 (wheel_joints): Convert pulses/s to rad/s
+                   hw_states_velocity_[i] = static_cast<double>(vel_val) / WHEEL_JOINT_PULSES_PER_RAD;
               } else {
-                   hw_states_velocity_[i] = static_cast<double>(vel_val);
+                   hw_states_velocity_[i] = static_cast<double>(vel_val) / WHEEL_JOINT_PULSES_PER_RAD;
               }
               
+              // Read Torque
               int16_t tor_val = EC_READ_S16(domain_pd_ + pdo_offset_.actual_torque[slave_idx]);
-              hw_states_effort_[i] = static_cast<double>(tor_val);
+              if (slave_idx == 3 || slave_idx == 4) {
+                   // Slave 3, 4 (clamp_wheel_joints): Convert raw to Nm
+                   hw_states_effort_[i] = static_cast<double>(tor_val) * CLAMP_WHEEL_NM_PER_RAW;
+              } else {
+                   hw_states_effort_[i] = static_cast<double>(tor_val);
+              }
 
-              // 关键：如果还没 Enabled 或者 正在校准，强制 Command = State
-                          uint16_t status = EC_READ_U16(domain_pd_ + pdo_offset_.status_word[slave_idx]);
-                          bool is_calibrating = (slave_idx == 0 && calib_state_ != CalibState::DONE && calib_state_ != CalibState::IDLE);
-                          
-                          if ((status & 0x6F) != 0x27 || is_calibrating) { 
-                              // 注意：如果刚刚完成校准 (DONE)，我们不应该在这里覆盖 hw_commands_position_
-                              // 因为我们在 MOVE_TO_ZERO 中已经将其设为 0 了
-                              // 但是，如果 ROS Controller 还没启动，hw_commands_position_ 可能会被 Controller 覆盖
-                              
-                              // 这里我们只在非 DONE 状态下同步
-                              if (calib_state_ != CalibState::DONE) {
-                                  hw_commands_position_[i] = hw_states_position_[i];
-                              }
-                          }
-
-                          // 调试日志：监控状态字变化
-                          static uint16_t last_status = 0;
-                          if (slave_idx == 0 && status != last_status) {
-                              RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"), "Slave 0 Status Changed: 0x%04X", status);
-                              last_status = status;
-                          }
+              // Sync Command with State if not Operation Enabled
+              // This prevents jumps when controller starts
+              uint16_t status = EC_READ_U16(domain_pd_ + pdo_offset_.status_word[slave_idx]);
+              if ((status & 0x6F) != 0x27) { 
+                  hw_commands_position_[i] = hw_states_position_[i];
+              }
 
           } else {
               // Loopback for unmapped joints
@@ -675,48 +742,29 @@ hardware_interface::return_type EthercatHardwareInterface::write(
           if (JOINT_TO_SLAVE_MAP.count(joint_name) > 0) {
               int slave_idx = JOINT_TO_SLAVE_MAP.at(joint_name);
               
-              // 只有当状态为 Operation Enabled 且 不在校准时，才更新目标位置
+              // Only update target when Operation Enabled and Not Calibrating
               uint16_t status = EC_READ_U16(domain_pd_ + pdo_offset_.status_word[slave_idx]);
               bool is_calibrating = (slave_idx == 0 && calib_state_ != CalibState::DONE && calib_state_ != CalibState::IDLE);
 
               if ((status & 0x6F) == 0x27 && !is_calibrating) {
                    
-                   if (slave_idx == 0 && calib_state_ == CalibState::DONE) {
-                       // 刚刚完成校准，我们可能还没收到来自 Controller 的 0 指令
-                       // 此时 hw_commands_position_ 可能还是旧值 (校准前的状态)
-                       // 强制覆盖为 0
-                       if (std::abs(hw_commands_position_[i]) > 0.5) { // 简单保护：如果指令位置太大(>0.5m)，说明 Controller 还没接管
-                           hw_commands_position_[i] = 0;
-                       }
-                   }
-                   
                    if (slave_idx == 0) {
-                       // Slave 0: Meters -> Pulses
-                       int32_t target_pulses = static_cast<int32_t>(hw_commands_position_[i] * STRAIGHT_JOINT_PULSES_PER_METER);
-                       EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[slave_idx], target_pulses);
+                       // Slave 0: Meters -> Pulses, Apply Software Offset
+                       // Target Hardware = (Target Software * Scale) + Hardware Offset
+                       int32_t target_software_pulses = static_cast<int32_t>(hw_commands_position_[i] * STRAIGHT_JOINT_PULSES_PER_METER);
+                       int32_t target_hardware_pulses = target_software_pulses + hw_home_offset_[slave_idx];
+                       //RCLCPP_INFO(rclcpp::get_logger("EthercatHardwareInterface"),"Target Software Pulses: %d, Target Hardware Pulses: %d", target_software_pulses, target_hardware_pulses);
+                       EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[slave_idx], target_hardware_pulses);
                    } else if (slave_idx == 1 || slave_idx == 2) {
-                       EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[slave_idx], static_cast<int32_t>(hw_commands_velocity_[i]));
+                       // Slave 1, 2 (wheel_joints): rad/s -> pulses/s
+                       int32_t target_hardware_vel = static_cast<int32_t>(hw_commands_velocity_[i] * WHEEL_JOINT_PULSES_PER_RAD);
+                       EC_WRITE_S32(domain_pd_ + pdo_offset_.target_velocity[slave_idx], target_hardware_vel);
                    } else if (slave_idx == 3 || slave_idx == 4) {
-                       EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[slave_idx], static_cast<int16_t>(hw_commands_effort_[i]));
-                   }
-
-                   if(slave_idx == 0)
-                   {
-                      // 写入 home offset 到 PDO
-                      EC_WRITE_S32(domain_pd_ + pdo_offset_.home_offset[slave_idx], hw_home_offset_[slave_idx]);
-                      int32_t actpos = EC_READ_S32(domain_pd_ + pdo_offset_.actual_position[slave_idx]);
-                      int32_t tagpos = EC_READ_S32(domain_pd_ + pdo_offset_.target_position[slave_idx]);
-                      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("EthercatHardwareInterface"), *clock_, 1000, "轴: %d, 实际位置: %d , 目标位置： %d, 状态字: 0x%04X", slave_idx, actpos, tagpos, status);
+                       // Slave 3, 4 (clamp_wheel_joints): Nm -> raw
+                       int16_t target_hardware_torque = static_cast<int16_t>(hw_commands_effort_[i] / CLAMP_WHEEL_NM_PER_RAW);
+                       EC_WRITE_S16(domain_pd_ + pdo_offset_.target_torque[slave_idx], target_hardware_torque);
                    }
                    
-              } else if (slave_idx == 0) {
-                  // 即使在校准状态，也需要写入 home offset
-                  EC_WRITE_S32(domain_pd_ + pdo_offset_.home_offset[slave_idx], hw_home_offset_[slave_idx]);
-                  
-                  // 强制写入目标位置为 0 (仅当处于 DONE 状态且刚切换回 CSP 时)
-                  if (calib_state_ == CalibState::DONE && (status & 0x6F) != 0x27) {
-                      EC_WRITE_S32(domain_pd_ + pdo_offset_.target_position[slave_idx], 0);
-                  }
               }
           }
       }

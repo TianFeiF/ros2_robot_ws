@@ -1,0 +1,9 @@
+<library path="rm_hardware_interface">
+  <class name="rm_hardware_interface/RmHardwareInterface"
+         type="rm_hardware_interface::RmHardwareInterface"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      RealMan Hardware Interface Plugin for ROS2 Control
+    </description>
+  </class>
+</library>

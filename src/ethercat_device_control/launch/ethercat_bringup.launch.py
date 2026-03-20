@@ -7,6 +7,8 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
+from launch_ros.parameter_descriptions import ParameterValue
+
 def generate_launch_description():
     # Get URDF via xacro from the robot_new_moveit package
     # Use the full URDF Xacro file which includes both robot description and ros2_control config
@@ -20,7 +22,7 @@ def generate_launch_description():
         ],
         on_stderr='warn'
     )
-    robot_description = {"robot_description": robot_description_content}
+    robot_description = {"robot_description": ParameterValue(robot_description_content, value_type=str)}
 
     # Use the controller config from this package
     robot_controllers = PathJoinSubstitution(
@@ -54,18 +56,39 @@ def generate_launch_description():
         arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
     )
 
-    # Spawner for joint trajectory controller
-    robot_controller_spawner = Node(
+    # Spawner for plan group controller
+    plan_group_controller_spawner = Node(
         package="controller_manager",
         executable="spawner",
-        arguments=["joint_trajectory_controller", "--controller-manager", "/controller_manager"],
+        arguments=["plan_group_controller", "--controller-manager", "/controller_manager"],
+    )
+
+    # Spawner for hand group controller
+    hand_group_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["hand_group_controller", "--controller-manager", "/controller_manager"],
+    )
+
+    # Spawner for base velocity controller
+    base_velocity_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["base_velocity_controller", "--controller-manager", "/controller_manager"],
+    )
+
+    # Spawner for base effort controller
+    base_effort_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["base_effort_controller", "--controller-manager", "/controller_manager"],
     )
 
     # Delay start of robot_controller after joint_state_broadcaster
     delay_robot_controller_spawner_after_joint_state_broadcaster_spawner = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=joint_state_broadcaster_spawner,
-            on_exit=[robot_controller_spawner],
+            on_exit=[plan_group_controller_spawner, hand_group_controller_spawner, base_velocity_controller_spawner, base_effort_controller_spawner],
         )
     )
 

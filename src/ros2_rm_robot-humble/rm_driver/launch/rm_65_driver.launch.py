@@ -21,7 +21,8 @@ def generate_launch_description():
             executable= "rm_driver",         #节点。
             parameters= [arm_config
                 ],             #接入参数文件
-            output= 'screen'
+            output= 'screen',
+            remappings=[('joint_states', 'rm_joint_states')]
             )
 
     ])

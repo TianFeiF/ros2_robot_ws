@@ -38,26 +38,16 @@ struct PdoOffset {
     std::vector<unsigned int> dummy_byte_2;
 };
 
-// 零点校准状态机枚举
+// Zero Calibration State Machine
 enum class CalibState {
-  IDLE,               // 闲置/正常运行
-  INIT,               // 初始化校准
-  WRITE_ZERO_OFFSET,  // 写 0 到 0x607C
-  WAIT_WRITE_ZERO,    // 等待写 0 完成
-  READ_ZERO,          // Trigger read 0x607C
-  WAIT_READ_ZERO,     // Wait read 0x607C
-  LOOP_START,         // 循环开始
-  MOVE_AWAY,          // 远离零点 (200力矩)
-  MOVE_CLOSE,         // 接近零点 (-260力矩)
-  RECORD_POS,         // 记录位置
-  CALC_OFFSET,        // 计算偏移量
-  WRITE_OFFSET,       // 写入偏移量到 0x607C
-  WAIT_WRITE_OFFSET,  // 等待写入完成
-  READ_OFFSET,        // Trigger read 0x607C
-  WAIT_READ_OFFSET,   // Wait read 0x607C
-  STABILIZE,          // 等待系统稳定 (1s)
-  MOVE_TO_ZERO,       // 运动到零点
-  DONE                // 完成
+  IDLE,               // Idle / Normal Operation
+  INIT,               // Initialization
+  LOOP_START,         // Start of a calibration loop
+  MOVE_AWAY,          // Move away from hard stop (Ramping Up)
+  MOVE_CLOSE,         // Move towards hard stop (Ramping Down/Negative)
+  CALC_OFFSET,        // Calculate average offset
+  MOVE_TO_ZERO,       // Move to zero position (Software)
+  DONE                // Calibration Complete
 };
 
 class EthercatHardwareInterface : public hardware_interface::SystemInterface
@@ -117,10 +107,10 @@ private:
   int calib_loop_count_ = 0;
   double calib_timer_ = 0.0; // 计时器
   std::vector<int32_t> calib_positions_;
-  ec_sdo_request_t *sdo_home_offset_ = nullptr; // SDO 请求句柄
+  double current_calib_velocity_ = 0.0;
   
-  // 用于 SDO 写入的辅助函数
-  void write_sdo_int32(int32_t value);
+  // Zero calibration logic (Software Offset)
+  void handle_zero_calibration(int slave_idx, const rclcpp::Duration & period, int8_t & target_mode, int16_t actual_torque);
   
   rclcpp::Clock::SharedPtr clock_;
 };
